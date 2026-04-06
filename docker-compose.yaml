@@ -1,0 +1,73 @@
+services:
+  # ── Official tournament (both variants) ──
+  tournament:
+    build: .
+    command: >
+      python tournament.py --official
+        --num-games ${NUM_GAMES:-5}
+        --move-timeout ${MOVE_TIMEOUT:-10}
+        --board-size ${BOARD_SIZE:-11}
+    volumes:
+      - ./results:/app/results
+      - ./estudiantes:/app/estudiantes
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+
+  # ── Real evaluation tournament (for class grading) ──
+  #    All students vs defaults, both variants, 10 games/pair
+  real-tournament:
+    build: .
+    command: >
+      python tournament.py --official --eval
+        --num-games ${NUM_GAMES:-10}
+        --move-timeout ${MOVE_TIMEOUT:-10}
+        --board-size ${BOARD_SIZE:-11}
+    volumes:
+      - ./results:/app/results
+      - ./estudiantes:/app/estudiantes
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+
+  # ── Single match experiment ──
+  experiment:
+    build: .
+    command: >
+      python experiment.py
+        --black ${BLACK:-Random}
+        --white ${WHITE:-Random}
+        --board-size ${BOARD_SIZE:-11}
+        --variant ${VARIANT:-classic}
+        --num-games ${NUM_GAMES:-5}
+        --verbose
+    volumes:
+      - ./results:/app/results
+      - ./estudiantes:/app/estudiantes
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+
+  # ── Team-local tournament (your strategy vs defaults) ──
+  team-tournament:
+    build: .
+    command: >
+      python tournament.py
+        --team ${TEAM:-_template}
+        --official
+        --num-games ${NUM_GAMES:-5}
+        --move-timeout ${MOVE_TIMEOUT:-10}
+        --json estudiantes/${TEAM:-_template}/results/tournament_results.json
+    volumes:
+      - ./estudiantes:/app/estudiantes
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
