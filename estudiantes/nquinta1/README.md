@@ -1,61 +1,39 @@
-# NQuinta_Strategy_v1 — Hex Agent
+# NQuinta_Strategy_v2 — Hex Agent
 
 ## Descripción
 
-`NQuinta_Strategy_v1` es un agente para el juego de **Hex (11x11, variante clásica)** diseñado para competir en el torneo del curso.
+`NQuinta_Strategy_v2` es un agente heurístico para Hex 11x11 diseñado para competir en el torneo del curso.
 
-La estrategia implementa un enfoque heurístico enfocado en:
-- Control del centro del tablero
-- Conectividad progresiva entre lados
-- Bloqueo básico del oponente
-- Construcción de caminos eficientes
+La estrategia no usa búsqueda Monte Carlo completa, sino una evaluación heurística de cada movimiento legal basada en:
 
-El agente fue evaluado contra un oponente aleatorio (`Random`), logrando un desempeño perfecto.
+- reducción de la distancia de conexión propia
+- aumento de la distancia de conexión del rival
+- ocupación de casillas valiosas para bloquear al oponente
+- preferencia por jugadas conectadas con piedras propias
+- control del centro en etapas tempranas
 
-## Resultados
+## Idea principal
 
-### vs Random (20 partidas)
+Para cada jugada legal, el agente simula:
 
-- **Victorias:** 20 / 20 (100%)
-- **Derrotas:** 0
-- **Longitud promedio de partida:** 32 movimientos
+1. cómo cambia su distancia mínima de conexión
+2. cómo cambia la distancia mínima de conexión del rival
+3. qué tan peligrosa sería esa casilla si la ocupara el oponente
 
-Esto demuestra que el agente:
-- Mantiene consistencia en decisiones
-- Construye caminos ganadores de forma estable
-- No depende del azar
+Con esa información asigna un puntaje y elige la mejor jugada.
 
-## Estrategia
+## Heurísticas usadas
 
-El agente sigue una lógica sencilla pero efectiva:
+- **Centro al inicio:** si el centro está libre, se prioriza.
+- **Victoria inmediata:** si una jugada gana la partida, se toma de inmediato.
+- **Bloqueo preventivo:** se favorecen casillas que también serían muy fuertes para el rival.
+- **Conectividad local:** se premian jugadas adyacentes a piedras propias.
+- **Balance ofensivo-defensivo:** se combina avance propio con contención del oponente.
 
-1. **Prioridad al centro**
-   - Intenta ocupar posiciones centrales al inicio
-   - Mejora la flexibilidad y conectividad
+## Archivo principal
 
-2. **Expansión de conexiones**
-   - Busca extender sus propias piezas
-   - Favorece caminos continuos hacia su objetivo
+- `estudiantes/nquinta1/strategy.py`
 
-3. **Bloqueo del oponente**
-   - Detecta posibles conexiones del rival
-   - Interrumpe trayectorias clave
+## Comentarios
 
-4. **Selección heurística**
-   - Evalúa movimientos posibles
-   - Elige aquellos que maximizan conexión y control
-
-## Implementación
-
-El agente está implementado en `strategy.py`.
-
-Clase principal: `NQuintaStrategy`
-
-La lógica principal está en el método `play(...)`, donde se evalúan todos los movimientos legales disponibles y se selecciona el que mejor balancea avance propio, contención del rival y cercanía al centro.
-
-## Cómo ejecutar
-
-Ejemplo de experimento:
-
-```bash
-python3 experiment.py --black "NQuinta_Strategy_v1" --white "Random" --num-games 20
+Es una estrategia heurística ligera, pensada para mantenerse dentro del límite de tiempo por jugada y ofrecer un desempeño mejor que un agente aleatorio.
