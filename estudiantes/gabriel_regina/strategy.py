@@ -2,21 +2,18 @@
 Estrategia MCTS + RAVE para Hex 11x11.
 Autores: <gabriel_regina>
 
-Version 3: Volvemos a la base que daba 2/10 vs Tier 2,
-con UN solo cambio: mejorar la selección del primer movimiento
-y el rollout priorizando el camino Dijkstra CORRECTAMENTE.
-
-Cambios respecto a v1 (la que daba 2/10):
-  - _path_cells arreglado: solo devuelve celdas que reducen la distancia
-  - PATH_P bajo (0.30) para no sobre-sesgar
-  - CUTOFF_FILL de vuelta a 0.65 (no cambiar esto fue un error)
-  - UCT_C de vuelta a 1.2 (necesitamos exploración con 121 celdas)
-  - _expand NO usa path_cells (eso era el bug más grave)
+Version 6:
+  Root parallelization: 3 procesos MCTS independientes + 1 principal = 4 cores.
+  Soft eval: sigmoid continuo de diferencia de distancias Dijkstra (mejor señal).
+  Mantiene: Fix 1-5 de V5 (sin atajo apertura, tabla transposicion, tiempo
+            dinamico, bias direccional, FPU bidireccional, tree reuse).
 """
 
 from __future__ import annotations
 
+import heapq
 import math
+import multiprocessing as mp
 import random
 import time
 from collections import defaultdict
@@ -30,24 +27,58 @@ from hex_game import (
 )
 
 # ---------------------------------------------------------------------------
-# Constantes — conservadoras, solo un cambio real vs v1
+# Constantes
 # ---------------------------------------------------------------------------
-UCT_C        = 1.2      # De vuelta al original
-RAVE_K       = 400
-RAVE_BLEND   = 0.8
-TIME_BUDGET  = 0.85     # Margen seguro en Docker ARM
-CUTOFF_FILL  = 0.65     # De vuelta al original — 0.50 era demasiado agresivo
-NEIGHBOR_P   = 0.75
-PATH_P       = 0.30     # Bajo: solo sesga el rollout levemente hacia el camino
+UCT_C         = 1.2
+RAVE_K        = 400
+RAVE_BLEND    = 0.8
+TIME_BUDGET   = 0.92
+CUTOFF_FILL   = 0.65
+NEIGHBOR_P    = 0.75
+DIRECTION_P   = 0.20
+DIRECTION_K   = 5
+EXPAND_RADIUS = 2
+TRANS_CAP     = 50
+NUM_WORKERS   = 3   # workers adicionales; total = NUM_WORKERS + 1 main
 
 
 # ---------------------------------------------------------------------------
-# Nodo del árbol MCTS
+# Pool de celdas vacias — seleccion y eliminacion en O(1)
+# ---------------------------------------------------------------------------
+class _EmptyPool:
+    __slots__ = ("cells", "pos")
+
+    def __init__(self, board, size):
+        self.cells = []
+        self.pos = {}
+        for r in range(size):
+            for c in range(size):
+                if board[r][c] == 0:
+                    self.pos[(r, c)] = len(self.cells)
+                    self.cells.append((r, c))
+
+    def random(self):
+        return self.cells[random.randrange(len(self.cells))]
+
+    def remove(self, cell):
+        idx = self.pos.pop(cell)
+        last = self.cells.pop()
+        if idx < len(self.cells):
+            self.cells[idx] = last
+            self.pos[last] = idx
+
+    def __len__(self):
+        return len(self.cells)
+
+
+# ---------------------------------------------------------------------------
+# Nodo del arbol MCTS
 # ---------------------------------------------------------------------------
 class _Node:
     __slots__ = (
         "move", "parent", "children", "visits", "wins",
-        "rave_visits", "rave_wins", "untried_moves", "player_to_move"
+        "rave_visits", "rave_wins", "untried_moves", "player_to_move",
+        "_board_hash",
     )
 
     def __init__(self, move, parent, untried_moves, player_to_move):
@@ -60,11 +91,12 @@ class _Node:
         self.rave_wins      = defaultdict(float)
         self.untried_moves  = untried_moves
         self.player_to_move = player_to_move
+        self._board_hash    = None
 
     def is_fully_expanded(self):
         return len(self.untried_moves) == 0
 
-    def uct_rave_score(self, parent_visits, my_player):
+    def uct_rave_score(self, parent_visits):
         if self.visits == 0:
             return float("inf")
         exploit = self.wins / self.visits
@@ -88,208 +120,287 @@ def _board_to_lists(board):
     return [list(row) for row in board]
 
 
-def _count_filled(board, size):
-    total = 0
+def _soft_eval(board, size, root_player, next_to_move):
+    """Eval continuo [0,1]: sigmoid de diferencia de distancias + tempo."""
+    my_dist  = shortest_path_distance(board, size, root_player)
+    opp_dist = shortest_path_distance(board, size, 3 - root_player)
+    INF = size * size + 1
+    if my_dist >= INF:
+        return 0.0
+    if opp_dist >= INF:
+        return 1.0
+    if next_to_move != root_player:
+        opp_dist = max(0, opp_dist - 1)
+    diff = opp_dist - my_dist
+    return 1.0 / (1.0 + math.exp(-diff * 0.8))
+
+
+def _neighborhood_empties(board, size, empties, radius=EXPAND_RADIUS):
+    pieces_exist = False
+    in_nbhd = [[False] * size for _ in range(size)]
     for r in range(size):
+        row = board[r]
         for c in range(size):
-            if board[r][c] != 0:
-                total += 1
-    return total
+            if row[c] != 0:
+                pieces_exist = True
+                rmin = max(0, r - radius)
+                rmax = min(size - 1, r + radius)
+                cmin = max(0, c - radius)
+                cmax = min(size - 1, c + radius)
+                for nr in range(rmin, rmax + 1):
+                    nrow = in_nbhd[nr]
+                    for nc in range(cmin, cmax + 1):
+                        nrow[nc] = True
+    if not pieces_exist:
+        return None
+    return [m for m in empties if in_nbhd[m[0]][m[1]]]
 
 
-def _find_bridges(board, size, player):
-    defend = set()
-    pieces = [(r, c) for r in range(size) for c in range(size)
-              if board[r][c] == player]
-    for i, (r1, c1) in enumerate(pieces):
-        n1 = set(get_neighbors(r1, c1, size))
-        for r2, c2 in pieces[i+1:]:
-            n2 = set(get_neighbors(r2, c2, size))
-            shared = [x for x in n1 & n2 if board[x[0]][x[1]] == 0]
-            if len(shared) == 2:
-                defend.update(shared)
-    return defend
+def _candidates(board, size, empties):
+    nbhd = _neighborhood_empties(board, size, empties)
+    if nbhd and len(nbhd) >= 5:
+        return nbhd
+    if nbhd is None:
+        center = size // 2
+        radius = size // 3
+        return [(r, c) for r, c in empties
+                if abs(r - center) <= radius and abs(c - center) <= radius]
+    return list(empties)
 
 
-def _bridges_threatened(board, size, player, last_opp_move):
-    if last_opp_move is None:
-        return set()
-    bridges = _find_bridges(board, size, player)
-    r, c = last_opp_move
-    threatened = set()
-    opp_neighbors = set(get_neighbors(r, c, size))
-    for cell in bridges:
-        if cell in opp_neighbors:
-            threatened.add(cell)
-    return threatened
+# ---------------------------------------------------------------------------
+# FPU: Dijkstra bidireccional para ordenar candidatos en la raiz
+# ---------------------------------------------------------------------------
 
-
-def _dijkstra_eval(board, size, player):
-    my_dist  = shortest_path_distance(board, size, player)
-    opp      = 3 - player
-    opp_dist = shortest_path_distance(board, size, opp)
-    return opp_dist - my_dist
-
-
-def _dijkstra_path_cells(board, size, player):
-    """
-    Devuelve celdas vacías que están en algún camino mínimo del jugador.
-    Una celda vacía está en el camino mínimo si:
-      dist_desde_inicio[r][c] + dist_hasta_fin[r][c] == distancia_total
-    
-    Esta es la forma correcta de encontrar celdas en el camino Dijkstra.
-    Solo funciona bien cuando el jugador ya tiene algunas piezas.
-    """
-    import heapq
+def _full_dijkstra(board, size, player, from_start):
     INF = float("inf")
     opp = 3 - player
-    size_sq = size
+    dist = {}
+    heap = []
 
-    def dijkstra_forward(start_cells):
-        dist = [[INF] * size_sq for _ in range(size_sq)]
-        heap = []
-        for (r, c, cost) in start_cells:
-            if cost < dist[r][c]:
-                dist[r][c] = cost
-                heapq.heappush(heap, (cost, r, c))
-        while heap:
-            d, r, c = heapq.heappop(heap)
-            if d > dist[r][c]:
-                continue
-            for nr, nc in get_neighbors(r, c, size_sq):
-                if board[nr][nc] == opp:
-                    continue
-                add = 0 if board[nr][nc] == player else 1
-                nd = d + add
-                if nd < dist[nr][nc]:
-                    dist[nr][nc] = nd
-                    heapq.heappush(heap, (nd, nr, nc))
-        return dist
-
-    # Forward: desde el borde de inicio
-    if player == 1:  # Negro: fila 0 → fila N-1
-        fwd_starts = [(0, c, 0 if board[0][c] == player else (1 if board[0][c] == 0 else INF))
-                      for c in range(size_sq) if board[0][c] != opp]
-        bwd_starts = [(size_sq-1, c, 0 if board[size_sq-1][c] == player else (1 if board[size_sq-1][c] == 0 else INF))
-                      for c in range(size_sq) if board[size_sq-1][c] != opp]
-    else:  # Blanco: col 0 → col N-1
-        fwd_starts = [(r, 0, 0 if board[r][0] == player else (1 if board[r][0] == 0 else INF))
-                      for r in range(size_sq) if board[r][0] != opp]
-        bwd_starts = [(r, size_sq-1, 0 if board[r][size_sq-1] == player else (1 if board[r][size_sq-1] == 0 else INF))
-                      for r in range(size_sq) if board[r][size_sq-1] != opp]
-
-    fwd = dijkstra_forward(fwd_starts)
-    bwd = dijkstra_forward(bwd_starts)
-
-    # Distancia total del camino más corto
     if player == 1:
-        total = min(fwd[size_sq-1][c] for c in range(size_sq))
+        edge_rc = [(0, c) for c in range(size)] if from_start \
+                  else [(size - 1, c) for c in range(size)]
     else:
-        total = min(fwd[r][size_sq-1] for r in range(size_sq))
+        edge_rc = [(r, 0) for r in range(size)] if from_start \
+                  else [(r, size - 1) for r in range(size)]
 
-    # Count player pieces — if none, no path bias
-    has_pieces = any(board[r][c] == player for r in range(size_sq) for c in range(size_sq))
-    if total == INF or not has_pieces:
-        return []
+    for r, c in edge_rc:
+        if board[r][c] == opp:
+            continue
+        d = 0 if board[r][c] == player else 1
+        if d < dist.get((r, c), INF):
+            dist[(r, c)] = d
+            heapq.heappush(heap, (d, r, c))
 
-    # Celdas vacías en algún camino mínimo
-    on_path = []
-    for r in range(size_sq):
-        for c in range(size_sq):
-            if board[r][c] == 0:
-                if fwd[r][c] != INF and bwd[r][c] != INF:
-                    if fwd[r][c] + bwd[r][c] == total + 1:
-                        on_path.append((r, c))
-    return on_path
+    while heap:
+        d, r, c = heapq.heappop(heap)
+        if d > dist.get((r, c), INF):
+            continue
+        for nr, nc in get_neighbors(r, c, size):
+            if board[nr][nc] == opp:
+                continue
+            add = 0 if board[nr][nc] == player else 1
+            nd = d + add
+            if nd < dist.get((nr, nc), INF):
+                dist[(nr, nc)] = nd
+                heapq.heappush(heap, (nd, nr, nc))
+
+    return dist
+
+
+def _fpu_order(board, size, candidates, player):
+    """Celdas en camino Dijkstra minimo van al final (pop() las extrae primero)."""
+    if not candidates:
+        return candidates
+
+    INF = float("inf")
+    fwd = _full_dijkstra(board, size, player, from_start=True)
+    bwd = _full_dijkstra(board, size, player, from_start=False)
+
+    if player == 1:
+        total = min(fwd.get((size - 1, c), INF) for c in range(size))
+    else:
+        total = min(fwd.get((r, size - 1), INF) for r in range(size))
+
+    if total == INF:
+        random.shuffle(candidates)
+        return candidates
+
+    on_path = set()
+    for r, c in candidates:
+        f = fwd.get((r, c), INF)
+        b_d = bwd.get((r, c), INF)
+        if f != INF and b_d != INF and f + b_d == total + 1:
+            on_path.add((r, c))
+
+    path_cells  = [m for m in candidates if m in on_path]
+    other_cells = [m for m in candidates if m not in on_path]
+    random.shuffle(other_cells)
+    random.shuffle(path_cells)
+    return other_cells + path_cells
 
 
 # ---------------------------------------------------------------------------
-# Rollout informado — Dijkstras pre-calculados, 0 Dijkstras en el loop MCTS
+# Rollout rapido con bias direccional
 # ---------------------------------------------------------------------------
 
-def _seed_last_moves(board, size):
-    """Pieza más central de cada jugador como semilla de NEIGHBOR_P."""
-    center = (size - 1) / 2.0
-    result = {1: None, 2: None}
-    for player in [1, 2]:
-        best, best_d = None, float("inf")
-        for r in range(size):
-            for c in range(size):
-                if board[r][c] == player:
-                    d = abs(r - center) + abs(c - center)
-                    if d < best_d:
-                        best_d, best = d, (r, c)
-        result[player] = best
-    return result
-
-
-def _informed_rollout(board, size, player_to_move, root_player,
-                      path_cells, last_move=None):
-    """path_cells: dict {player: set} pre-calculado en play(). 0 Dijkstras aqui."""
-    b = _board_to_lists(board)
+def _fast_rollout(b, size, player_to_move, root_player, pool, filled):
     current = player_to_move
-    total_cells = size * size
-    cutoff = int(CUTOFF_FILL * total_cells)
+    cutoff = int(CUTOFF_FILL * size * size)
     moves_played = []
+    last = None
 
-    last_by_player = _seed_last_moves(board, size)
-    last_opp_move = last_move
-    filled = sum(1 for r in range(size) for c in range(size) if b[r][c] != 0)
+    p1_top   = any(b[0][c] == 1 for c in range(size))
+    p1_bot   = any(b[size - 1][c] == 1 for c in range(size))
+    p2_left  = any(b[r][0] == 2 for r in range(size))
+    p2_right = any(b[r][size - 1] == 2 for r in range(size))
 
-    for _ in range(total_cells * 2):
-        if filled >= cutoff:
-            eval_score = _dijkstra_eval(b, size, root_player)
-            return (1.0 if eval_score > 0 else 0.0), moves_played
+    while filled < cutoff and len(pool) > 0:
+        chosen = None
 
-        empties = empty_cells(b, size)
-        if not empties:
-            break
+        if last is not None and random.random() < NEIGHBOR_P:
+            r, c = last
+            nbrs = [(nr, nc) for nr, nc in get_neighbors(r, c, size)
+                    if b[nr][nc] == 0]
+            if nbrs:
+                chosen = nbrs[random.randrange(len(nbrs))]
 
-        my_last = last_by_player[current]
-        my_path = path_cells[current]   # set O(1)
-
-        # 1. Bridge defense
-        defend = _bridges_threatened(b, size, current, last_opp_move)
-        defend = [m for m in defend if b[m[0]][m[1]] == 0]
-        if defend:
-            chosen = random.choice(defend)
-
-        # 2. Path bias — O(1), sin Dijkstra
-        elif my_path and random.random() < PATH_P:
-            candidates = [m for m in my_path if b[m[0]][m[1]] == 0]
-            if candidates:
-                chosen = random.choice(candidates)
-            elif my_last is not None:
-                r, c = my_last
-                nbrs = [n for n in get_neighbors(r, c, size) if b[n[0]][n[1]] == 0]
-                chosen = random.choice(nbrs) if nbrs else random.choice(empties)
+        if chosen is None and len(pool) >= DIRECTION_K \
+                and random.random() < DIRECTION_P:
+            samples = [pool.cells[random.randrange(len(pool.cells))]
+                       for _ in range(DIRECTION_K)]
+            if current == 1:
+                chosen = max(samples, key=lambda rc: rc[0])
             else:
-                chosen = random.choice(empties)
+                chosen = max(samples, key=lambda rc: rc[1])
 
-        # 3. Vecino de MI ultima pieza
-        elif my_last is not None and random.random() < NEIGHBOR_P:
-            r, c = my_last
-            nbrs = [n for n in get_neighbors(r, c, size) if b[n[0]][n[1]] == 0]
-            chosen = random.choice(nbrs) if nbrs else random.choice(empties)
+        if chosen is None:
+            chosen = pool.random()
 
-        # 4. Aleatorio
-        else:
-            chosen = random.choice(empties)
-
-        b[chosen[0]][chosen[1]] = current
-        moves_played.append((chosen, current))
-        last_by_player[current] = chosen
-        last_opp_move = chosen
+        cr, cc = chosen
+        b[cr][cc] = current
+        pool.remove(chosen)
         filled += 1
+        moves_played.append((chosen, current))
 
-        winner = check_winner(b, size)
-        if winner != 0:
-            return (1.0 if winner == root_player else 0.0), moves_played
+        if current == 1:
+            if cr == 0:
+                p1_top = True
+            elif cr == size - 1:
+                p1_bot = True
+            if p1_top and p1_bot and check_winner(b, size) == 1:
+                return (1.0 if root_player == 1 else 0.0), moves_played
+        else:
+            if cc == 0:
+                p2_left = True
+            elif cc == size - 1:
+                p2_right = True
+            if p2_left and p2_right and check_winner(b, size) == 2:
+                return (1.0 if root_player == 2 else 0.0), moves_played
 
+        last = chosen
         current = 3 - current
 
-    eval_score = _dijkstra_eval(b, size, root_player)
-    return (1.0 if eval_score > 0 else 0.0), moves_played
+    return _soft_eval(b, size, root_player, current), moves_played
+
+
+# ---------------------------------------------------------------------------
+# Funciones MCTS standalone (usadas por main y workers)
+# ---------------------------------------------------------------------------
+
+def _mcts_select(node, board):
+    b = _board_to_lists(board)
+    while node.is_fully_expanded() and node.children:
+        best_child = max(node.children, key=lambda c: c.uct_rave_score(node.visits))
+        node = best_child
+        b[node.move[0]][node.move[1]] = 3 - node.player_to_move
+    return node, b
+
+
+def _mcts_expand(node, board, size, trans_table=None):
+    move = node.untried_moves.pop()
+    b = [list(row) for row in board]
+    b[move[0]][move[1]] = node.player_to_move
+    next_player = 3 - node.player_to_move
+    child_empties = [(r, c) for r in range(size) for c in range(size) if b[r][c] == 0]
+    cands = _candidates(b, size, child_empties)
+    random.shuffle(cands)
+    child = _Node(move=move, parent=node, untried_moves=cands, player_to_move=next_player)
+    if trans_table is not None:
+        bkey = hash(tuple(tuple(row) for row in b))
+        child._board_hash = bkey
+        if bkey in trans_table:
+            prior_v, prior_w = trans_table[bkey]
+            if prior_v > TRANS_CAP:
+                prior_w = prior_w * TRANS_CAP / prior_v
+                prior_v = TRANS_CAP
+            child.visits += prior_v
+            child.wins   += prior_w
+    node.children.append(child)
+    return child, b
+
+
+def _mcts_backpropagate(node, result, sim_moves, trans_table=None):
+    amaf = defaultdict(set)
+    for (move, player) in sim_moves:
+        amaf[player].add(move)
+    current = node
+    while current is not None:
+        current.visits += 1
+        current.wins   += result
+        if trans_table is not None and current._board_hash is not None:
+            trans_table[current._board_hash] = (current.visits, current.wins)
+        if current.parent is not None:
+            player_moved = current.parent.player_to_move
+            for m in amaf[player_moved]:
+                current.parent.rave_visits[m] += 1
+                current.parent.rave_wins[m]   += result
+        current = current.parent
+
+
+def _build_root(board, size, player, empties):
+    """Construye nodo raiz con candidatos ordenados por FPU."""
+    cands = _candidates(board, size, empties)
+    if not cands:
+        cands = list(empties)
+    n_empty = len(empties)
+    if n_empty == size * size:
+        center = (size // 2, size // 2)
+        rest = [m for m in cands if m != center]
+        random.shuffle(rest)
+        cands = rest + ([center] if center in cands else rest[-1:])
+    else:
+        cands = _fpu_order(board, size, cands, player)
+    return _Node(move=None, parent=None, untried_moves=cands, player_to_move=player)
+
+
+def _worker_run(args):
+    """Worker independiente: MCTS por `duration` segundos. Retorna {move: visits}."""
+    board_tuple, size, player, duration, seed = args
+    random.seed(seed)
+    t0 = time.monotonic()
+    deadline = t0 + duration
+
+    empties = [(r, c) for r in range(size) for c in range(size)
+               if board_tuple[r][c] == 0]
+    if not empties:
+        return {}
+
+    root = _build_root(board_tuple, size, player, empties)
+
+    while time.monotonic() < deadline:
+        node, b_sim = _mcts_select(root, board_tuple)
+        if node.untried_moves:
+            node, b_sim = _mcts_expand(node, b_sim, size, None)
+        pool = _EmptyPool(b_sim, size)
+        filled = size * size - len(pool)
+        result, sim_moves = _fast_rollout(
+            b_sim, size, node.player_to_move, player, pool, filled
+        )
+        _mcts_backpropagate(node, result, sim_moves, None)
+
+    return {child.move: child.visits for child in root.children}
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +419,29 @@ class MiEstrategia(Strategy):
         self._opponent   = config.opponent
         self._time_limit = config.time_limit
         self._variant    = config.variant
+
         self._hidden_opp   = set()
         self._my_moves     = set()
         self._failed_moves = set()
+
+        self._root         = None
+        self._last_my_move = None
+        self._trans_table  = {}
+        self._move_count   = 0
+
+        # Terminar pool anterior y crear nuevo con fork
+        old_pool = getattr(self, '_pool', None)
+        if old_pool is not None:
+            try:
+                old_pool.terminate()
+                old_pool.join()
+            except Exception:
+                pass
+        try:
+            ctx = mp.get_context('fork')
+            self._pool = ctx.Pool(NUM_WORKERS)
+        except Exception:
+            self._pool = None
 
     def on_move_result(self, move, success):
         if success:
@@ -321,134 +452,126 @@ class MiEstrategia(Strategy):
 
     def play(self, board, last_move):
         t0 = time.monotonic()
-        deadline = t0 + self._time_limit * TIME_BUDGET
         size = self._size
+
+        self._move_count += 1
+        budget = min(0.97, TIME_BUDGET + 0.06 / (1.0 + self._move_count * 0.25))
+        duration = self._time_limit * budget
+        deadline = t0 + duration
 
         if self._variant == "dark":
             board = self._determinize(board)
+            self._root = None
 
         empties = empty_cells(board, size)
         if len(empties) == 1:
+            self._reset_tree(empties[0])
             return empties[0]
 
-        if len(empties) == size * size:
-            return (size // 2, size // 2)
-
-        # Movimiento ganador inmediato
+        # Victoria inmediata
         for m in empties:
-            b = _board_to_lists(board)
-            b[m[0]][m[1]] = self._player
-            if check_winner(b, size) == self._player:
+            brd = _board_to_lists(board)
+            brd[m[0]][m[1]] = self._player
+            if check_winner(brd, size) == self._player:
+                self._reset_tree(m)
                 return m
 
-        # Bloquear victoria inmediata del oponente
+        # Bloqueo de victoria del oponente
         for m in empties:
-            b = _board_to_lists(board)
-            b[m[0]][m[1]] = self._opponent
-            if check_winner(b, size) == self._opponent:
+            brd = _board_to_lists(board)
+            brd[m[0]][m[1]] = self._opponent
+            if check_winner(brd, size) == self._opponent:
+                self._reset_tree(m)
                 return m
 
-        # ── Calcular Dijkstra UNA SOLA VEZ por turno ─────────────────────
-        # Con este pre-calculo: 2 Dijkstras totales por turno.
-        # Sin el: ~4 Dijkstras por iteracion MCTS (expand×2 + rollout×2).
-        b_tuple = tuple(tuple(row) for row in board)
-        path_cells = {
-            1: set(_dijkstra_path_cells(b_tuple, size, 1)),
-            2: set(_dijkstra_path_cells(b_tuple, size, 2)),
-        }
-        # ─────────────────────────────────────────────────────────────────
+        # Enviar workers paralelos
+        board_tuple = (board if isinstance(board[0], tuple)
+                       else tuple(tuple(r) for r in board))
+        worker_duration = max(0.1, duration - 0.15)
+        async_result = None
+        if self._pool is not None:
+            try:
+                args_list = [
+                    (board_tuple, size, self._player,
+                     worker_duration, random.randint(0, 2**31))
+                    for _ in range(NUM_WORKERS)
+                ]
+                async_result = self._pool.map_async(_worker_run, args_list)
+            except Exception:
+                async_result = None
 
-        root = _Node(
-            move=None,
-            parent=None,
-            untried_moves=list(empties),
-            player_to_move=self._player,
-        )
+        # MCTS en proceso principal (con tree reuse y tabla de transposicion)
+        root = None
+        if self._variant == "classic":
+            root = self._descend_root(last_move)
+        if root is None:
+            root = _build_root(board, size, self._player, empties)
 
         while time.monotonic() < deadline:
-            node, b_sim = self._select(root, board)
+            node, b_sim = _mcts_select(root, board)
             if node.untried_moves:
-                node, b_sim = self._expand(node, b_sim, path_cells)
-            result, sim_moves = _informed_rollout(
-                b_sim, size, node.player_to_move, self._player,
-                path_cells, last_move   # FIX: last_move real, no None
+                node, b_sim = _mcts_expand(node, b_sim, size, self._trans_table)
+            pool_obj = _EmptyPool(b_sim, size)
+            filled = size * size - len(pool_obj)
+            result, sim_moves = _fast_rollout(
+                b_sim, size, node.player_to_move, self._player, pool_obj, filled
             )
-            self._backpropagate(node, result, sim_moves)
+            _mcts_backpropagate(node, result, sim_moves, self._trans_table)
 
-        if not root.children:
-            return random.choice(empties)
+        # Agregar votos de workers
+        vote_counts: dict = defaultdict(int)
+        for child in root.children:
+            vote_counts[child.move] += child.visits
 
-        best = max(root.children, key=lambda n: n.visits)
-        return best.move
+        if async_result is not None:
+            try:
+                worker_results = async_result.get(timeout=2.0)
+                for worker_votes in worker_results:
+                    for move, v in worker_votes.items():
+                        vote_counts[move] += v
+            except Exception:
+                pass
 
-    def _select(self, node, board):
-        b = _board_to_lists(board)
-        while node.is_fully_expanded() and node.children:
-            best_score = -float("inf")
-            best_child = None
-            for child in node.children:
-                s = child.uct_rave_score(node.visits, node.player_to_move)
-                if s > best_score:
-                    best_score = s
-                    best_child = child
-            node = best_child
-            b[node.move[0]][node.move[1]] = 3 - node.player_to_move
-        return node, b
+        if not vote_counts:
+            move = random.choice(empties)
+            self._reset_tree(move)
+            return move
 
-    def _expand(self, node, board, path_cells):
-        """Path bias + centro. 0 Dijkstras (usa path_cells pre-calculado)."""
-        player = node.player_to_move
-        path_set = path_cells.get(player, set())
-        center = (self._size - 1) / 2.0
-        PATH_BONUS = 4.0
+        best = max(vote_counts, key=vote_counts.get)
+        self._root = root
+        self._last_my_move = best
+        return best
 
-        weights = []
-        for (r, c) in node.untried_moves:
-            dist = abs(r - center) + abs(c - center)
-            center_w = 1.0 / (1.0 + dist)
-            path_w = PATH_BONUS if (r, c) in path_set else 1.0
-            weights.append(center_w * path_w)
+    # ------------------------------------------------------------------
+    # Tree reuse
+    # ------------------------------------------------------------------
+    def _reset_tree(self, my_move):
+        self._root = None
+        self._last_my_move = my_move
 
-        total_w = sum(weights)
-        r_val = random.random() * total_w
-        cumul = 0.0
-        move = node.untried_moves[-1]
-        for i, w in enumerate(weights):
-            cumul += w
-            if r_val <= cumul:
-                move = node.untried_moves[i]
+    def _descend_root(self, opp_last_move):
+        if self._root is None or self._last_my_move is None or opp_last_move is None:
+            return None
+        my_child = None
+        for c in self._root.children:
+            if c.move == self._last_my_move:
+                my_child = c
                 break
+        if my_child is None:
+            return None
+        opp_child = None
+        for c in my_child.children:
+            if c.move == opp_last_move:
+                opp_child = c
+                break
+        if opp_child is None:
+            return None
+        opp_child.parent = None
+        return opp_child
 
-        node.untried_moves.remove(move)
-        b = [list(row) for row in board]
-        b[move[0]][move[1]] = node.player_to_move
-        next_player = 3 - node.player_to_move
-
-        child = _Node(
-            move=move,
-            parent=node,
-            untried_moves=list(empty_cells(b, self._size)),
-            player_to_move=next_player,
-        )
-        node.children.append(child)
-        return child, b
-
-    def _backpropagate(self, node, result, sim_moves):
-        amaf = defaultdict(set)
-        for (move, player) in sim_moves:
-            amaf[player].add(move)
-
-        current = node
-        while current is not None:
-            current.visits += 1
-            current.wins   += result
-            if current.parent is not None:
-                player_moved = current.parent.player_to_move
-                for m in amaf[player_moved]:
-                    current.parent.rave_visits[m] += 1
-                    current.parent.rave_wins[m]   += result
-            current = current.parent
-
+    # ------------------------------------------------------------------
+    # Dark mode: determinizacion
+    # ------------------------------------------------------------------
     def _determinize(self, board):
         size = self._size
         known_opp = self._hidden_opp
